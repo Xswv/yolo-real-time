@@ -1,0 +1,1000 @@
+import os
+import math
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ============================================================
+# 0) 路径与基础配置（保持你的 cv2.imread 方式）
+# ============================================================
+MODEL_PATH = r"../yolov8n.pt"
+LEFT_IMG_PATH  = r"../serterpng/left_tv_true.jpg"
+RIGHT_IMG_PATH = r"../serterpng/right_tv_true.jpg"
+OUTPUT_PATH = r"../yolosgbm-y/result_final.png"
+SHOW = True
+
+CONF_THRES = 0.35
+IOU_THRES  = 0.45
+
+np.random.seed(0)
+
+# ============================================================
+# 1) 标定参数（你的 stereoconfig）
+# ============================================================
+from stereoconfig import stereoCamera
+stereo_cam = stereoCamera()
+
+# ============================================================
+# 2) 显示风格（按你要求：顶部白底黑字；yaw蓝字无底；occ红字无底；不加粗）
+# ============================================================
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+BOX_COLOR = (0, 255, 0)
+BOX_THICK = 2
+
+TOP_FONT_SCALE = 0.50
+TOP_FONT_THICK = 1
+TOP_BG_COLOR   = (255, 255, 255)
+TOP_TEXT_COLOR = (0, 0, 0)
+
+IN_FONT_SCALE = 0.55
+IN_FONT_THICK = 1
+YAW_COLOR = (255, 0, 0)   # BGR 蓝
+OCC_COLOR = (0, 0, 255)   # BGR 红
+
+# ============================================================
+# 3) 方案核心参数（泛化+精度：置信度驱动、边缘/纹理采样、子像素、LR一致性）
+# ============================================================
+# ——ASW(稀疏代价曲线)——
+WIN = 7
+GAMMA_C = 10.0
+GAMMA_S = 5.0
+
+MIN_DISP = 0
+NUM_DISP = 160  # max disparity range: [0, 159]
+
+# 采样与ROI安全
+INNER_SHRINK = 0.18
+EDGE_AVOID = 3
+BOUNDARY_BAND_RATIO = 0.10   # 再剔除边界带，抑制前景扩散（泛化关键）
+GRID = 6
+
+N_POINTS_BASE = 90           # 稍增采样点数提升鲁棒性
+MAX_TRIES_FACTOR = 25
+
+# 可靠性阈值：代价曲线尖锐/唯一性
+SHARP_THR = 0.18
+RATIO_THR = 1.12
+CURV_THR  = 1e-3             # 子像素拟合的曲率下限
+MIN_VALID_SAMPLES = 16
+
+# ——右目门控（仅做x范围门控，提升鲁棒性）——
+USE_RIGHT_BOX_GATE = True
+Y_TOL = 0.15
+
+# ——遮挡关系——
+OCC_OVERLAP_THR = 0.12
+FORBIDDEN_DILATE = 7
+DELTA_D = 1.5
+ENABLE_2MEANS_LAYER = True
+
+# ——SGBM回退：ROI + prior门控 + LR一致性——
+ENABLE_SGBM_FALLBACK = True
+SGBM_BLOCK = 5
+ROI_MARGIN = 30
+
+ENABLE_DISP_PRIOR_GATE = True
+DISP_GATE_RADIUS = 48     # 32~64
+DISP_GATE_MIN_SPAN = 64   # 至少这么大并对齐16
+
+LR_TH = 1.0               # 左右一致性阈值（像素）
+MIN_PIX_FALLBACK = 220    # ROI内可靠像素最少数
+
+# ——类别自适应（泛化关键：透明/反光物体可测性差，必须更保守）——
+TRANSPARENT_CLASSES = {"cup", "wine glass", "bottle", "glass"}  # 可按你数据集继续扩
+# 透明类：更严格、只用高梯度点（避免被背景吸走）
+TRANSPARENT_CONF_THR = 0.65
+TRANSPARENT_GRAD_THR = 18.0
+
+# 人：更严格边界剔除、偏向目标层（远层）选择
+PERSON_EXTRA_STRICT = True
+PERSON_CONF_THR = 0.55
+
+# 非透明普通类
+DEFAULT_CONF_THR = 0.45
+
+# 细化失败策略：透明类不靠谱就 no-depth；普通类可退回 coarse
+OCC_FAIL_POLICY_TRANSPARENT = "no_depth"
+OCC_FAIL_POLICY_DEFAULT = "keep_coarse"
+
+# ============================================================
+# 4) 工具函数：Rectify / 深度 / yaw / 绘制
+# ============================================================
+def build_rectify_maps_and_P1(stereo_cam, img_shape):
+    h, w = img_shape[:2]
+    image_size = (w, h)
+
+    K1 = np.asarray(stereo_cam.cam_matrix_left, dtype=np.float64)
+    K2 = np.asarray(stereo_cam.cam_matrix_right, dtype=np.float64)
+    D1 = np.asarray(stereo_cam.distortion_l, dtype=np.float64)
+    D2 = np.asarray(stereo_cam.distortion_r, dtype=np.float64)
+    R  = np.asarray(stereo_cam.R, dtype=np.float64)
+    T  = np.asarray(stereo_cam.T, dtype=np.float64)
+
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        K1, D1, K2, D2, image_size, R, T,
+        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0
+    )
+    lmap1, lmap2 = cv2.initUndistortRectifyMap(K1, D1, R1, P1, image_size, cv2.CV_16SC2)
+    rmap1, rmap2 = cv2.initUndistortRectifyMap(K2, D2, R2, P2, image_size, cv2.CV_16SC2)
+    return (lmap1, lmap2, rmap1, rmap2), P1
+
+def rectify_pair(left_img, right_img, maps):
+    lmap1, lmap2, rmap1, rmap2 = maps
+    rec_left  = cv2.remap(left_img,  lmap1, lmap2, cv2.INTER_LINEAR)
+    rec_right = cv2.remap(right_img, rmap1, rmap2, cv2.INTER_LINEAR)
+    return rec_left, rec_right
+
+def compute_depth_m(fx, B, disp):
+    if disp is None or disp <= 0:
+        return None
+    return float(fx * B / float(disp))
+
+def compute_yaw_deg(u, fx, cx):
+    return math.degrees(math.atan((u - cx) / (fx + 1e-9)))
+
+def draw_top_label(img, x1, y1, x2, y2, text):
+    (tw, th), bl = cv2.getTextSize(text, FONT, TOP_FONT_SCALE, TOP_FONT_THICK)
+    ytxt = int(y1) - 5
+    if ytxt - th - bl < 0:
+        ytxt = int(y2) + th + bl + 5
+
+    x1r = int(np.clip(x1, 0, img.shape[1] - 1))
+    y1r = int(np.clip(ytxt - th - bl, 0, img.shape[0] - 1))
+    x2r = int(np.clip(x1 + tw, 0, img.shape[1] - 1))
+    y2r = int(np.clip(ytxt, 0, img.shape[0] - 1))
+
+    cv2.rectangle(img, (x1r, y1r), (x2r, y2r), TOP_BG_COLOR, -1)
+    cv2.putText(img, text, (x1r, int(ytxt - bl)), FONT, TOP_FONT_SCALE,
+                TOP_TEXT_COLOR, TOP_FONT_THICK, cv2.LINE_AA)
+
+def draw_yaw_occ_inside(img, box, yaw_deg, is_occ):
+    x1, y1, x2, y2 = map(int, box)
+    pad = 3
+    base_x = x1 + pad
+    base_y = y2 - pad
+
+    yaw_text = f"yaw:{yaw_deg:+.1f}deg"
+    cv2.putText(img, yaw_text, (base_x, base_y), FONT, IN_FONT_SCALE,
+                YAW_COLOR, IN_FONT_THICK, cv2.LINE_AA)
+    (w1, _), _ = cv2.getTextSize(yaw_text, FONT, IN_FONT_SCALE, IN_FONT_THICK)
+
+    if is_occ:
+        cv2.putText(img, "OCC", (base_x + w1 + 6, base_y), FONT, IN_FONT_SCALE,
+                    OCC_COLOR, IN_FONT_THICK, cv2.LINE_AA)
+
+def draw_bbox_and_info(img, box, cls_name, conf, dist_m, yaw_deg, is_occ):
+    x1, y1, x2, y2 = map(int, box)
+    cv2.rectangle(img, (x1, y1), (x2, y2), BOX_COLOR, BOX_THICK)
+
+    if dist_m is None:
+        top = f"{cls_name} {conf:.2f} no-depth"
+    else:
+        top = f"{cls_name} {conf:.2f} {dist_m:.3f}m"
+    draw_top_label(img, x1, y1, x2, y2, top)
+    draw_yaw_occ_inside(img, box, yaw_deg, is_occ)
+
+# ============================================================
+# 5) YOLO 检测 / 右框匹配
+# ============================================================
+def run_yolo(model, img):
+    r = model(img, conf=CONF_THRES, iou=IOU_THRES, verbose=False)[0]
+    if r.boxes is None or len(r.boxes) == 0:
+        return [], [], []
+    boxes = r.boxes.xyxy.cpu().numpy().astype(np.float32)
+    confs = r.boxes.conf.cpu().numpy().astype(np.float32)
+    clss  = r.boxes.cls.cpu().numpy().astype(int)
+    return boxes, confs, clss
+
+def match_right_box(left_box, left_cls, right_boxes, right_confs, right_clss):
+    if len(right_boxes) == 0:
+        return None
+    x1, y1, x2, y2 = left_box
+    lh = max(1.0, y2 - y1)
+    lw = max(1.0, x2 - x1)
+
+    best = None
+    best_score = -1e9
+    lx = 0.5 * (x1 + x2)
+    for rb, rc, rcls in zip(right_boxes, right_confs, right_clss):
+        if rcls != left_cls:
+            continue
+        rx1, ry1, rx2, ry2 = rb
+        rh = max(1.0, ry2 - ry1)
+        rw = max(1.0, rx2 - rx1)
+
+        iy1 = max(y1, ry1); iy2 = min(y2, ry2)
+        yov = max(0.0, iy2 - iy1) / lh
+        if yov < (1.0 - Y_TOL):
+            continue
+
+        size_sim = -abs(np.log((rw * rh) / (lw * lh)))
+        rx = 0.5 * (rx1 + rx2)
+        x_pref = 0.0 if rx < lx else -1.0
+        score = 2.0 * yov + 0.5 * size_sim + 0.2 * float(rc) + x_pref
+        if score > best_score:
+            best_score = score
+            best = rb
+    return best
+
+# ============================================================
+# 6) 遮挡关系 / forbidden mask
+# ============================================================
+def overlap_ratio_far(near_box, far_box):
+    ax1, ay1, ax2, ay2 = near_box
+    bx1, by1, bx2, by2 = far_box
+    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1); ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_far = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter / area_far
+
+def build_forbidden_mask_in_left(far_box, occluder_boxes, img_h, img_w, dilate_px=7):
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    fx1, fy1, fx2, fy2 = map(int, far_box)
+    fx1 = max(0, min(fx1, img_w - 1)); fx2 = max(0, min(fx2, img_w))
+    fy1 = max(0, min(fy1, img_h - 1)); fy2 = max(0, min(fy2, img_h))
+    if fx2 <= fx1 or fy2 <= fy1:
+        return mask
+
+    for ob in occluder_boxes:
+        ax1, ay1, ax2, ay2 = map(int, ob)
+        ix1 = max(fx1, ax1); iy1 = max(fy1, ay1)
+        ix2 = min(fx2, ax2); iy2 = min(fy2, ay2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        mask[iy1:iy2, ix1:ix2] = 255
+
+    if dilate_px > 0 and np.any(mask > 0):
+        k = 2 * dilate_px + 1
+        mask = cv2.dilate(mask, np.ones((k, k), np.uint8), iterations=1)
+    return mask
+
+# ============================================================
+# 7) ASW：边缘/纹理引导采样 + 代价曲线 + 子像素拟合 + 置信度
+# ============================================================
+def asw_weights(patchL, I0, gamma_c=10.0, gamma_s=5.0):
+    k = patchL.shape[0]
+    kh = k // 2
+    ys, xs = np.indices((k, k))
+    dc = np.abs(patchL - I0)
+    w_c = np.exp(-dc / gamma_c)
+    ds = np.abs(ys - kh) + np.abs(xs - kh)
+    w_s = np.exp(-ds / gamma_s)
+    W = w_c * w_s
+    s = float(np.sum(W))
+    if s < 1e-6:
+        return None
+    return W / (s + 1e-6)
+
+def _round_up_to_16(x):
+    x = int(x)
+    return int(math.ceil(x / 16.0) * 16)
+
+def _disp_gate_from_prior(d_prior, d_min, d_max):
+    if (not ENABLE_DISP_PRIOR_GATE) or (d_prior is None) or (not np.isfinite(d_prior)):
+        return int(d_min), int(d_max)
+    lo = int(math.floor(d_prior - DISP_GATE_RADIUS))
+    hi = int(math.ceil (d_prior + DISP_GATE_RADIUS))
+    lo = max(int(d_min), lo)
+    hi = min(int(d_max), hi)
+    if hi <= lo:
+        return int(d_min), int(d_max)
+    return lo, hi
+
+def parabolic_subpixel(d0, c_m1, c0, c_p1):
+    # 以代价值为 y，d 为 x，拟合抛物线，求极小点偏移
+    denom = (c_m1 - 2.0 * c0 + c_p1)
+    if abs(denom) < 1e-9:
+        return float(d0), 0.0
+    delta = 0.5 * (c_m1 - c_p1) / denom
+    delta = float(np.clip(delta, -1.0, 1.0))
+    d_sub = float(d0) + delta
+    curvature = float(denom)  # 对极小点应为正
+    return d_sub, curvature
+
+def sample_points_guided(gray, box, n_points, forbidden_mask=None,
+                         shrink=0.18, edge_avoid=3, boundary_band_ratio=0.10,
+                         grad_thr=0.0):
+    h, w = gray.shape
+    x1, y1, x2, y2 = map(float, box)
+    bw = max(1.0, x2 - x1); bh = max(1.0, y2 - y1)
+
+    # shrink
+    dx = bw * shrink; dy = bh * shrink
+    ix1 = int(np.clip(x1 + dx, 0, w - 1))
+    ix2 = int(np.clip(x2 - dx, 0, w - 1))
+    iy1 = int(np.clip(y1 + dy, 0, h - 1))
+    iy2 = int(np.clip(y2 - dy, 0, h - 1))
+    if ix2 <= ix1 or iy2 <= iy1:
+        ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+
+    # edge avoid
+    ix1 += edge_avoid; iy1 += edge_avoid
+    ix2 -= edge_avoid; iy2 -= edge_avoid
+    if ix2 <= ix1 or iy2 <= iy1:
+        return []
+
+    # boundary band removal（再剔除边界带，抑制前景扩散）
+    bandx = int((ix2 - ix1) * boundary_band_ratio)
+    bandy = int((iy2 - iy1) * boundary_band_ratio)
+    ix1b = ix1 + bandx; ix2b = ix2 - bandx
+    iy1b = iy1 + bandy; iy2b = iy2 - bandy
+    if ix2b > ix1b and iy2b > iy1b:
+        ix1, ix2, iy1, iy2 = ix1b, ix2b, iy1b, iy2b
+
+    # 取ROI
+    roi = gray[iy1:iy2, ix1:ix2]
+    if roi.size < 100:
+        return []
+
+    # 梯度（用于纹理可匹配性）
+    gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+
+    # 候选点：高梯度优先（透明类只取高梯度）
+    cand = np.where(mag > float(grad_thr))
+    ys = cand[0].astype(np.int32)
+    xs = cand[1].astype(np.int32)
+    if ys.size == 0:
+        # 没有高梯度，退化为全ROI随机
+        ys, xs = np.where(np.ones_like(roi, dtype=bool))
+        ys = ys.astype(np.int32); xs = xs.astype(np.int32)
+
+    # 把候选点按梯度大小排序采样（更稳）
+    vals = mag[ys, xs].astype(np.float32)
+    order = np.argsort(-vals)
+    ys = ys[order]; xs = xs[order]
+
+    pts = []
+    max_tries = int(n_points * MAX_TRIES_FACTOR)
+    tries = 0
+
+    # 网格均匀：每格最多取1~2个
+    gx_n = max(1, GRID); gy_n = max(1, GRID)
+    cell_w = max(1, (ix2 - ix1) // gx_n)
+    cell_h = max(1, (iy2 - iy1) // gy_n)
+
+    used_cells = {}
+    for k in range(ys.size):
+        if len(pts) >= n_points:
+            break
+        x = int(ix1 + xs[k])
+        y = int(iy1 + ys[k])
+
+        if forbidden_mask is not None and forbidden_mask[y, x] > 0:
+            continue
+
+        cx = (x - ix1) // cell_w
+        cy = (y - iy1) // cell_h
+        key = (cx, cy)
+        if used_cells.get(key, 0) >= 2:
+            continue
+        used_cells[key] = used_cells.get(key, 0) + 1
+        pts.append((x, y))
+
+    # 不够再补随机（带拒绝）
+    while len(pts) < n_points and tries < max_tries:
+        tries += 1
+        x = int(np.random.randint(ix1, ix2))
+        y = int(np.random.randint(iy1, iy2))
+        if forbidden_mask is not None and forbidden_mask[y, x] > 0:
+            continue
+        pts.append((x, y))
+
+    return pts
+
+def cost_curve_at_point(grayL, grayR, x, y, d_min, d_max, win, gamma_c, gamma_s,
+                        gate_x_range=None, d_prior=None):
+    h, w = grayL.shape
+    kh = win // 2
+    if x - kh < 0 or x + kh + 1 > w or y - kh < 0 or y + kh + 1 > h:
+        return None
+
+    patchL = grayL[y - kh:y + kh + 1, x - kh:x + kh + 1]
+    I0 = float(grayL[y, x])
+    Wgt = asw_weights(patchL, I0, gamma_c, gamma_s)
+    if Wgt is None:
+        return None
+
+    d_lo, d_hi = _disp_gate_from_prior(d_prior, d_min, d_max)
+
+    costs = []
+    ds = []
+    for d in range(d_lo, d_hi + 1):
+        xr = x - d
+        if gate_x_range is not None:
+            if xr < gate_x_range[0] or xr > gate_x_range[1]:
+                continue
+        xr0, xr1 = xr - kh, xr + kh + 1
+        if xr0 < 0 or xr1 > w:
+            continue
+        patchR = grayR[y - kh:y + kh + 1, xr0:xr1]
+        diff = np.abs(patchL - patchR)
+        c = float(np.sum(Wgt * diff))
+        costs.append(c); ds.append(d)
+
+    if len(costs) < 8:
+        return None
+
+    costs = np.array(costs, np.float32)
+    ds    = np.array(ds, np.int32)
+
+    kbest = int(np.argmin(costs))
+    d_best_int = int(ds[kbest])
+    c0 = float(costs[kbest])
+
+    # 次优：排除最优附近±2
+    mask = np.ones_like(costs, dtype=bool)
+    mask[max(0, kbest - 2):min(len(costs), kbest + 3)] = False
+    c2 = float(np.min(costs[mask])) if np.any(mask) else float(np.max(costs))
+    ratio = (c2 + 1e-6) / (c0 + 1e-6)
+    sharp = (float(np.mean(costs)) - c0) / (c0 + 1e-6)
+
+    # 子像素：抛物线拟合
+    curvature = 0.0
+    d_sub = float(d_best_int)
+    if 1 <= kbest <= len(costs) - 2:
+        c_m1 = float(costs[kbest - 1])
+        c_p1 = float(costs[kbest + 1])
+        d_sub, curvature = parabolic_subpixel(d_best_int, c_m1, c0, c_p1)
+
+    return d_sub, sharp, ratio, curvature
+
+def iqr_filter(values, k=1.5):
+    v = values.astype(np.float32)
+    if v.size < 20:
+        return v, np.ones_like(v, dtype=bool)
+    q1, q3 = np.percentile(v, [25, 75])
+    iqr = q3 - q1
+    lo = q1 - k * iqr
+    hi = q3 + k * iqr
+    keep = (v >= lo) & (v <= hi)
+    if np.count_nonzero(keep) < 12:
+        keep = np.ones_like(v, dtype=bool)
+    return v[keep], keep
+
+def weighted_median(v, w):
+    order = np.argsort(v)
+    v = v[order]; w = w[order]
+    c = np.cumsum(w)
+    t = 0.5 * c[-1]
+    idx = int(np.searchsorted(c, t))
+    return float(v[min(idx, v.size - 1)])
+
+def two_means_1d(values, weights=None, iters=12):
+    v = values.astype(np.float32)
+    if v.size < 10:
+        return None
+    c1 = np.percentile(v, 30)
+    c2 = np.percentile(v, 70)
+    for _ in range(iters):
+        d1 = np.abs(v - c1)
+        d2 = np.abs(v - c2)
+        lab = (d2 < d1).astype(np.int32)
+        if weights is None:
+            c1n = float(np.mean(v[lab == 0])) if np.any(lab == 0) else c1
+            c2n = float(np.mean(v[lab == 1])) if np.any(lab == 1) else c2
+        else:
+            w = weights.astype(np.float32)
+            c1n = float(np.sum(v[lab == 0] * w[lab == 0]) / (np.sum(w[lab == 0]) + 1e-6)) if np.any(lab == 0) else c1
+            c2n = float(np.sum(v[lab == 1] * w[lab == 1]) / (np.sum(w[lab == 1]) + 1e-6)) if np.any(lab == 1) else c2
+        if abs(c1n - c1) < 1e-3 and abs(c2n - c2) < 1e-3:
+            c1, c2 = c1n, c2n
+            break
+        c1, c2 = c1n, c2n
+    return (c1, c2, lab)
+
+def sparse_asw_disparity(grayL, grayR, left_box, right_box=None,
+                         forbidden_mask=None, d_max=None,
+                         n_points=90, prefer_far_layer=False, d_prior=None,
+                         grad_thr=0.0):
+    h, w = grayL.shape
+
+    gate_x = None
+    if USE_RIGHT_BOX_GATE and right_box is not None:
+        rx1, ry1, rx2, ry2 = map(float, right_box)
+        gate_x = (int(max(0, rx1)), int(min(w - 1, rx2)))
+
+    pts = sample_points_guided(
+        grayL, left_box, n_points,
+        forbidden_mask=forbidden_mask,
+        shrink=INNER_SHRINK, edge_avoid=EDGE_AVOID,
+        boundary_band_ratio=BOUNDARY_BAND_RATIO,
+        grad_thr=grad_thr
+    )
+
+    d_min = MIN_DISP
+    d_hi = MIN_DISP + NUM_DISP - 1
+    if d_max is not None:
+        d_hi = min(d_hi, int(math.floor(d_max)))
+
+    ds = []
+    ws = []
+    rel_scores = []
+
+    for (x, y) in pts:
+        out = cost_curve_at_point(
+            grayL, grayR, x, y,
+            d_min=d_min, d_max=d_hi,
+            win=WIN, gamma_c=GAMMA_C, gamma_s=GAMMA_S,
+            gate_x_range=gate_x, d_prior=d_prior
+        )
+        if out is None:
+            continue
+        d_sub, sharp, ratio, curvature = out
+
+        # 可靠性判据（泛化关键：透明/弱纹理会被压掉）
+        if sharp < SHARP_THR:
+            continue
+        if ratio < RATIO_THR:
+            continue
+        if curvature < CURV_THR:
+            continue
+        if d_max is not None and d_sub > float(d_max):
+            continue
+
+        # 权重：sharp * (ratio-1) * curvature（抑制平坦曲线）
+        w_i = float(max(0.0, sharp) * max(0.0, ratio - 1.0) * max(0.0, curvature))
+        if w_i <= 0:
+            continue
+
+        ds.append(float(d_sub))
+        ws.append(w_i)
+
+        # 单点可靠性分数（0~1粗略归一）
+        rs = 0.0
+        rs += min(1.0, sharp / 0.35)
+        rs += min(1.0, (ratio - 1.0) / 0.25)
+        rs += min(1.0, curvature / 2.0)
+        rel_scores.append(rs / 3.0)
+
+    if len(ds) < MIN_VALID_SAMPLES:
+        return None, 0.0, 0
+
+    ds = np.array(ds, np.float32)
+    ws = np.array(ws, np.float32)
+    rel_scores = np.array(rel_scores, np.float32)
+
+    ds2, keep = iqr_filter(ds, k=1.5)
+    ws2 = ws[keep] if keep is not None and keep.size == ds.size else ws
+    rel2 = rel_scores[keep] if keep is not None and keep.size == ds.size else rel_scores
+    if ds2.size < 12:
+        ds2, ws2, rel2 = ds, ws, rel_scores
+
+    # 遮挡场景：两簇选更远层（更小视差）
+    if prefer_far_layer and ENABLE_2MEANS_LAYER and ds2.size >= 20:
+        out = two_means_1d(ds2, weights=ws2)
+        if out is not None:
+            c1, c2, lab = out
+            far_label = 0 if c1 < c2 else 1
+            d_far = ds2[lab == far_label]
+            w_far = ws2[lab == far_label]
+            r_far = rel2[lab == far_label]
+            if d_far.size >= 10 and np.sum(w_far) > 1e-6:
+                d_hat = weighted_median(d_far, w_far)
+                # 置信度：有效样本比例 + 平均可靠性 + 簇分离度
+                sep = abs(c1 - c2)
+                conf = 0.0
+                conf += min(1.0, d_far.size / float(max(1, n_points))) * 0.35
+                conf += float(np.clip(np.mean(r_far), 0, 1)) * 0.45
+                conf += min(1.0, sep / 6.0) * 0.20
+                return d_hat, float(conf), int(d_far.size)
+
+    d_hat = weighted_median(ds2, ws2)
+    conf = 0.0
+    conf += min(1.0, ds2.size / float(max(1, n_points))) * 0.35
+    conf += float(np.clip(np.mean(rel2), 0, 1)) * 0.65
+    return d_hat, float(conf), int(ds2.size)
+
+# ============================================================
+# 8) SGBM：ROI + prior门控 + LR一致性可靠mask + 视差域统计
+# ============================================================
+def create_sgbm(min_disp, num_disp):
+    num_disp = max(16, _round_up_to_16(num_disp))
+    return cv2.StereoSGBM_create(
+        minDisparity=int(min_disp),
+        numDisparities=int(num_disp),
+        blockSize=int(SGBM_BLOCK),
+        P1=8 * 3 * SGBM_BLOCK ** 2,
+        P2=32 * 3 * SGBM_BLOCK ** 2,
+        disp12MaxDiff=1,
+        uniquenessRatio=10,
+        speckleWindowSize=80,
+        speckleRange=16,
+        preFilterCap=63,
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+    )
+
+def sgbm_roi_lr_consistent(rec_left, rec_right, left_box,
+                          forbidden_mask=None, d_max=None,
+                          prefer_far_layer=False, d_prior=None,
+                          grad_thr=0.0):
+    H, W = rec_left.shape[:2]
+    x1, y1, x2, y2 = map(float, left_box)
+    rx1 = max(0, int(x1) - ROI_MARGIN)
+    ry1 = max(0, int(y1) - ROI_MARGIN)
+    rx2 = min(W, int(x2) + ROI_MARGIN)
+    ry2 = min(H, int(y2) + ROI_MARGIN)
+    if rx2 <= rx1 or ry2 <= ry1:
+        return None, 0.0, 0
+
+    L = rec_left[ry1:ry2, rx1:rx2]
+    R = rec_right[ry1:ry2, rx1:rx2]
+    gL = cv2.cvtColor(L, cv2.COLOR_BGR2GRAY)
+    gR = cv2.cvtColor(R, cv2.COLOR_BGR2GRAY)
+
+    # disparity range
+    full_dmin = MIN_DISP
+    full_dmax = MIN_DISP + NUM_DISP - 1
+    if d_max is not None:
+        full_dmax = min(full_dmax, int(math.floor(d_max)))
+
+    if ENABLE_DISP_PRIOR_GATE and (d_prior is not None) and np.isfinite(d_prior):
+        dmin = max(full_dmin, int(math.floor(d_prior - DISP_GATE_RADIUS)))
+        dmax = min(full_dmax, int(math.ceil (d_prior + DISP_GATE_RADIUS)))
+        if dmax <= dmin:
+            dmin, dmax = full_dmin, full_dmax
+    else:
+        dmin, dmax = full_dmin, full_dmax
+
+    num_disp = max(DISP_GATE_MIN_SPAN, (dmax - dmin + 1))
+    num_disp = _round_up_to_16(num_disp)
+    if dmin + num_disp - 1 > full_dmax:
+        dmin = max(full_dmin, full_dmax - num_disp + 1)
+
+    stereoL = create_sgbm(dmin, num_disp)
+    stereoR = create_sgbm(dmin, num_disp)
+
+    dispL = stereoL.compute(gL, gR).astype(np.float32) / 16.0
+    dispR = stereoR.compute(gR, gL).astype(np.float32) / 16.0
+
+    dispL[dispL < 1] = 0
+    dispR[dispR < 1] = 0
+
+    # LR一致性 mask
+    h, w = dispL.shape
+    xs = np.arange(w, dtype=np.int32)[None, :].repeat(h, axis=0)
+    ys = np.arange(h, dtype=np.int32)[:, None].repeat(w, axis=1)
+
+    d = dispL
+    xr = (xs - d).astype(np.int32)
+    valid = (d > 0) & (xr >= 0) & (xr < w)
+
+    dR_at = np.zeros_like(dispL, dtype=np.float32)
+    dR_at[valid] = dispR[ys[valid], xr[valid]]
+
+    lr_ok = valid & (dR_at > 0) & (np.abs(d - dR_at) <= LR_TH)
+
+    # forbidden mask
+    if forbidden_mask is not None:
+        f = forbidden_mask[ry1:ry2, rx1:rx2]
+        lr_ok = lr_ok & (f == 0)
+
+    # 目标框内缩 + 边界带剔除
+    bx1 = int(x1 - rx1); by1 = int(y1 - ry1)
+    bx2 = int(x2 - rx1); by2 = int(y2 - ry1)
+    bw = max(1, bx2 - bx1); bh = max(1, by2 - by1)
+    dx = int(bw * INNER_SHRINK); dy = int(bh * INNER_SHRINK)
+
+    ix1 = int(np.clip(bx1 + dx, 0, w - 1))
+    ix2 = int(np.clip(bx2 - dx, 0, w))
+    iy1 = int(np.clip(by1 + dy, 0, h - 1))
+    iy2 = int(np.clip(by2 - dy, 0, h))
+    if ix2 <= ix1 or iy2 <= iy1:
+        ix1 = int(np.clip(bx1, 0, w - 1))
+        ix2 = int(np.clip(bx2, 0, w))
+        iy1 = int(np.clip(by1, 0, h - 1))
+        iy2 = int(np.clip(by2, 0, h))
+
+    bandx = int((ix2 - ix1) * BOUNDARY_BAND_RATIO)
+    bandy = int((iy2 - iy1) * BOUNDARY_BAND_RATIO)
+    ix1b = ix1 + bandx; ix2b = ix2 - bandx
+    iy1b = iy1 + bandy; iy2b = iy2 - bandy
+    if ix2b > ix1b and iy2b > iy1b:
+        ix1, ix2, iy1, iy2 = ix1b, ix2b, iy1b, iy2b
+
+    sub_disp = dispL[iy1:iy2, ix1:ix2]
+    sub_ok   = lr_ok[iy1:iy2, ix1:ix2]
+
+    # 纹理门槛（透明类只取高梯度像素）
+    if grad_thr > 0:
+        roi = gL[iy1:iy2, ix1:ix2].astype(np.float32)
+        gx = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        sub_ok = sub_ok & (mag > float(grad_thr))
+
+    v = sub_disp[sub_ok].astype(np.float32)
+    if d_max is not None:
+        v = v[v <= float(d_max)]
+    if v.size < MIN_PIX_FALLBACK:
+        return None, 0.0, int(v.size)
+
+    # IQR
+    q1, q3 = np.percentile(v, [25, 75])
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr; hi = q3 + 1.5 * iqr
+    keep = (v >= lo) & (v <= hi)
+    if np.count_nonzero(keep) >= 80:
+        v = v[keep]
+
+    # 遮挡时：两簇选更远层
+    if prefer_far_layer and ENABLE_2MEANS_LAYER and v.size >= 300:
+        out = two_means_1d(v)
+        if out is not None:
+            c1, c2, lab = out
+            far_label = 0 if c1 < c2 else 1
+            vv = v[lab == far_label]
+            if vv.size >= 80:
+                d_hat = float(np.median(vv))
+                sep = abs(c1 - c2)
+                pass_rate = float(vv.size) / float((iy2 - iy1) * (ix2 - ix1) + 1e-6)
+                conf = 0.0
+                conf += min(1.0, pass_rate / 0.25) * 0.45
+                conf += min(1.0, sep / 6.0) * 0.25
+                conf += 0.30  # LR ok 本身已筛过
+                return d_hat, float(min(1.0, conf)), int(vv.size)
+
+    d_hat = float(np.median(v))
+    pass_rate = float(v.size) / float((iy2 - iy1) * (ix2 - ix1) + 1e-6)
+    conf = min(1.0, pass_rate / 0.25)  # 0~1
+    return d_hat, float(conf), int(v.size)
+
+# ============================================================
+# 9) 主流程：粗估 -> 遮挡图 -> 被遮挡细化 -> 置信度门控 -> 输出
+# ============================================================
+def main():
+    model = YOLO(MODEL_PATH)
+
+    left = cv2.imread(LEFT_IMG_PATH)
+    right = cv2.imread(RIGHT_IMG_PATH)
+    if left is None or right is None:
+        print("[ERROR] image path invalid.")
+        return
+
+    maps, P1 = build_rectify_maps_and_P1(stereo_cam, left.shape)
+    rec_left, rec_right = rectify_pair(left, right, maps)
+
+    fx_rect = float(P1[0, 0])
+    cx_rect = float(P1[0, 2])
+
+    # baseline 单位自适配（Tx>10 多半mm）
+    Tx = float(np.asarray(stereo_cam.T, dtype=np.float64).reshape(3, 1)[0, 0])
+    if abs(Tx) > 10.0:
+        B = abs(Tx) / 1000.0
+        unit = "mm->m"
+    else:
+        B = abs(Tx)
+        unit = "m"
+    print("==== Stereo Params Used ====")
+    print(f"fx_rect = {fx_rect:.3f}px, cx_rect = {cx_rect:.3f}px, B = {B:.6f}m ({unit})")
+    print("============================")
+
+    l_boxes, l_confs, l_clss = run_yolo(model, rec_left)
+    r_boxes, r_confs, r_clss = run_yolo(model, rec_right)
+    print(f"[INFO] left det: {len(l_boxes)}, right det: {len(r_boxes)}")
+
+    H, W = rec_left.shape[:2]
+    grayL = cv2.cvtColor(rec_left, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    grayR = cv2.cvtColor(rec_right, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # 右框关联
+    right_match = [None] * len(l_boxes)
+    for i in range(len(l_boxes)):
+        right_match[i] = match_right_box(l_boxes[i], int(l_clss[i]), r_boxes, r_confs, r_clss)
+
+    # -------------------------
+    # 阶段A：粗视差/粗深度 + 置信度
+    # -------------------------
+    d_coarse = [None] * len(l_boxes)
+    conf_coarse = [0.0] * len(l_boxes)
+    z_coarse = [None] * len(l_boxes)
+
+    for i in range(len(l_boxes)):
+        cls_name = model.names[int(l_clss[i])] if hasattr(model, "names") else str(int(l_clss[i]))
+        is_trans = (cls_name in TRANSPARENT_CLASSES)
+        is_person = (cls_name == "person")
+
+        grad_thr = TRANSPARENT_GRAD_THR if is_trans else 0.0
+
+        d, conf_d, n_ok = sparse_asw_disparity(
+            grayL, grayR,
+            left_box=l_boxes[i],
+            right_box=right_match[i],
+            forbidden_mask=None,
+            d_max=None,
+            n_points=N_POINTS_BASE,
+            prefer_far_layer=False,
+            d_prior=None,
+            grad_thr=grad_thr
+        )
+
+        # ASW不够再回退SGBM（同样做纹理门槛+LR一致性）
+        if (d is None or conf_d < 0.15) and ENABLE_SGBM_FALLBACK:
+            d2, conf2, n2 = sgbm_roi_lr_consistent(
+                rec_left, rec_right, l_boxes[i],
+                forbidden_mask=None, d_max=None,
+                prefer_far_layer=False,
+                d_prior=None,
+                grad_thr=grad_thr
+            )
+            if d2 is not None:
+                d, conf_d = d2, max(conf_d, conf2)
+
+        d_coarse[i] = d
+        conf_coarse[i] = float(conf_d)
+        z_coarse[i] = compute_depth_m(fx_rect, B, d)
+
+    # -------------------------
+    # 阶段B：遮挡关系图（用粗深度排序）
+    # -------------------------
+    order = sorted(
+        range(len(l_boxes)),
+        key=lambda i: (z_coarse[i] is None, z_coarse[i] if z_coarse[i] is not None else 1e9)
+    )
+
+    occluders_of = [[] for _ in range(len(l_boxes))]
+    for a in order:
+        if z_coarse[a] is None:
+            continue
+        for b in order:
+            if b == a:
+                continue
+            if z_coarse[b] is None:
+                continue
+            if z_coarse[a] >= z_coarse[b]:
+                continue
+            r = overlap_ratio_far(l_boxes[a], l_boxes[b])
+            if r >= OCC_OVERLAP_THR:
+                occluders_of[b].append(a)
+
+    # -------------------------
+    # 阶段C：被遮挡目标细化（目标层提取 + d_max + forbidden）
+    # -------------------------
+    d_final = [None] * len(l_boxes)
+    conf_final = [0.0] * len(l_boxes)
+    z_final = [None] * len(l_boxes)
+
+    for i in range(len(l_boxes)):
+        cls_name = model.names[int(l_clss[i])] if hasattr(model, "names") else str(int(l_clss[i]))
+        is_trans = (cls_name in TRANSPARENT_CLASSES)
+        is_person = (cls_name == "person")
+        is_occ = (len(occluders_of[i]) > 0)
+
+        if not is_occ:
+            d_final[i] = d_coarse[i]
+            conf_final[i] = conf_coarse[i]
+            z_final[i] = z_coarse[i]
+            continue
+
+        # 遮挡物视差上界
+        dmax_list = []
+        oc_boxes = []
+        for a in occluders_of[i]:
+            if d_coarse[a] is not None:
+                dmax_list.append(float(d_coarse[a]) - DELTA_D)
+            oc_boxes.append(l_boxes[a])
+        d_max = float(np.min(dmax_list)) if len(dmax_list) > 0 else None
+        if d_max is not None:
+            d_max = max(1.0, d_max)
+
+        forbidden = build_forbidden_mask_in_left(l_boxes[i], oc_boxes, H, W, dilate_px=FORBIDDEN_DILATE)
+
+        # 被遮挡目标：优先选更远层（更小视差）
+        prefer_far = True
+
+        # 先验：粗视差（若被遮挡，先验可能偏大，因此与 d_max 取min）
+        d_prior = d_coarse[i] if (d_coarse[i] is not None) else None
+        if d_prior is not None and d_max is not None:
+            d_prior = min(float(d_prior), float(d_max))
+
+        grad_thr = TRANSPARENT_GRAD_THR if is_trans else 0.0
+
+        # 先走ASW细估（带 forbidden + d_max + far-layer）
+        d, conf_d, n_ok = sparse_asw_disparity(
+            grayL, grayR,
+            left_box=l_boxes[i],
+            right_box=right_match[i],
+            forbidden_mask=forbidden,
+            d_max=d_max,
+            n_points=int(N_POINTS_BASE * 1.25),
+            prefer_far_layer=prefer_far,
+            d_prior=d_prior,
+            grad_thr=grad_thr
+        )
+
+        # 不够再回退SGBM（同样 forbidden + d_max + far-layer + LR一致性）
+        if (d is None or conf_d < 0.20) and ENABLE_SGBM_FALLBACK:
+            d2, conf2, n2 = sgbm_roi_lr_consistent(
+                rec_left, rec_right, l_boxes[i],
+                forbidden_mask=forbidden,
+                d_max=d_max,
+                prefer_far_layer=prefer_far,
+                d_prior=d_prior,
+                grad_thr=grad_thr
+            )
+            if d2 is not None:
+                # 取更高置信的结果
+                if d is None or conf2 > conf_d:
+                    d, conf_d = d2, max(conf_d, conf2)
+
+        # 置信度门控（透明类更严格）
+        thr = TRANSPARENT_CONF_THR if is_trans else (PERSON_CONF_THR if is_person else DEFAULT_CONF_THR)
+
+        if d is None or conf_d < thr:
+            if is_trans and OCC_FAIL_POLICY_TRANSPARENT == "no_depth":
+                d_final[i] = None
+                conf_final[i] = float(conf_d)
+            else:
+                # 默认保守退回 coarse（避免频繁 no-depth）
+                if OCC_FAIL_POLICY_DEFAULT == "keep_coarse":
+                    d_final[i] = d_coarse[i]
+                    conf_final[i] = conf_coarse[i]
+                else:
+                    d_final[i] = None
+                    conf_final[i] = float(conf_d)
+        else:
+            # 额外防错：遮挡目标的细化视差不应比遮挡物更大（更近）
+            if d_max is not None and d > float(d_max) + 0.5:
+                # 视差过大说明选错层/被污染，透明类直接no-depth，其他回退coarse
+                if is_trans:
+                    d_final[i] = None
+                    conf_final[i] = float(conf_d)
+                else:
+                    d_final[i] = d_coarse[i]
+                    conf_final[i] = conf_coarse[i]
+            else:
+                d_final[i] = d
+                conf_final[i] = float(conf_d)
+
+        z_final[i] = compute_depth_m(fx_rect, B, d_final[i])
+
+    # -------------------------
+    # 阶段D：绘制输出（保持风格 + yaw/occ）
+    # -------------------------
+    for i in range(len(l_boxes)):
+        cls_name = model.names[int(l_clss[i])] if hasattr(model, "names") else str(int(l_clss[i]))
+        conf_det = float(l_confs[i])
+
+        x1, y1, x2, y2 = map(float, l_boxes[i])
+        u = 0.5 * (x1 + x2)
+        yaw = compute_yaw_deg(u, fx_rect, cx_rect)
+
+        is_occ = (len(occluders_of[i]) > 0)
+
+        draw_bbox_and_info(
+            rec_left, l_boxes[i], cls_name, conf_det,
+            z_final[i], yaw, is_occ
+        )
+
+        # 你做实验时建议把这些打印出来，定位为何“杯子/人”不准
+        print(f"[DBG] {i:02d} {cls_name:>10s} det={conf_det:.2f} "
+              f"occ={is_occ} d0={d_coarse[i]} c0={conf_coarse[i]:.2f} "
+              f"df={d_final[i]} cf={conf_final[i]:.2f} Z={z_final[i]}")
+
+    out = Path(OUTPUT_PATH)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), rec_left)
+    print(f"[INFO] saved: {out}")
+
+    if SHOW:
+        cv2.imshow("YOLO + (ASW/SGBM) occlusion-aware depth", rec_left)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
